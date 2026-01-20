@@ -1,0 +1,10 @@
+openpyxl
+google-genai
+onnxocr
+pdf2image
+opencv-python
+tree-sitter
+tree-sitter-languages
+networkx
+tiktoken
+pyperclip
