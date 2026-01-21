@@ -128,3 +128,5 @@ venv/
 .history/
 
 __pycache__/
+
+*.json

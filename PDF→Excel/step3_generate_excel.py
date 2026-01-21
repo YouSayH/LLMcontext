@@ -3,21 +3,16 @@ import re
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Side
 from openpyxl.utils.cell import get_column_letter
-from openpyxl.cell.cell import MergedCell # 追加
 
 def clean_text(text):
-    """Excelで保存できない不正な制御文字を除去し、数式誤認を防ぐ"""
     if text is None: return ""
-    text = str(text)
-    # 制御文字除去
+    text = str(text).strip()
     text = re.sub(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # 数式エスケープ
     if text.startswith("="):
         text = "'" + text
     return text
 
 def cluster_coords(coords, tolerance):
-    """近接座標の統合"""
     if not coords: return []
     sorted_coords = sorted(list(coords))
     clusters = []
@@ -26,69 +21,43 @@ def cluster_coords(coords, tolerance):
         if c - current_cluster[-1] <= tolerance:
             current_cluster.append(c)
         else:
-            clusters.append(min(current_cluster))
+            clusters.append(int(sum(current_cluster) / len(current_cluster)))
             current_cluster = [c]
-    clusters.append(min(current_cluster))
+    clusters.append(int(sum(current_cluster) / len(current_cluster)))
     return clusters
 
-def optimize_grid(cols, rows, elements, tolerance):
-    """空のグリッド区間を削除"""
-    col_has_content = [False] * (len(cols) - 1)
-    row_has_content = [False] * (len(rows) - 1)
-    
-    for el in elements:
-        if el['type'] == 'page_size': continue
-        
-        c_start = bisect.bisect_left(cols, el['x0'] + 2) - 1
-        c_end = bisect.bisect_left(cols, el.get('x1', el['x0']) - 2) - 1
-        r_start = bisect.bisect_left(rows, el['top'] + 2) - 1
-        r_end = bisect.bisect_left(rows, el.get('bottom', el['top']) - 2) - 1
-        
-        c_start = max(0, c_start)
-        r_start = max(0, r_start)
-        c_end = min(len(col_has_content)-1, c_end)
-        r_end = min(len(row_has_content)-1, r_end)
-
-        for c in range(c_start, c_end + 1): col_has_content[c] = True
-        for r in range(r_start, r_end + 1): row_has_content[r] = True
-
-    new_cols = [cols[0]]
-    for i, active in enumerate(col_has_content):
-        if active or (cols[i+1] - cols[i] > 150):
-            new_cols.append(cols[i+1])
-            
-    new_rows = [rows[0]]
-    for i, active in enumerate(row_has_content):
-        if active or (rows[i+1] - rows[i] > 150):
-            new_rows.append(rows[i+1])
-            
-    return new_cols, new_rows
-
-def apply_border_safe(ws, r, c, border_type):
-    """枠線適用（安全版）"""
+def apply_border_to_range(ws, r_start, c_start, r_end, c_end, border_type):
+    """範囲全体の外枠に線を引く"""
     thin = Side(border_style="thin", color="000000")
-    try:
-        cell = ws.cell(row=r, column=c)
-        # 結合セルの場合、スタイル適用は無視するか、親を探す必要があるが
-        # 枠線に関してはエラーが出にくいのでそのままトライ
-        current = cell.border
-        new_sides = {k: getattr(current, k) for k in ['left', 'right', 'top', 'bottom']}
-        if border_type in ['line_h', 'all']:
-            new_sides['top'] = thin
-            new_sides['bottom'] = thin
-        if border_type in ['line_v', 'all']:
-            new_sides['left'] = thin
-            new_sides['right'] = thin
-        cell.border = Border(**new_sides)
-    except: pass
+    
+    # 上辺
+    if border_type in ['line_h', 'all', 'box']:
+        for c in range(c_start, c_end + 1):
+            cell = ws.cell(row=r_start, column=c)
+            b = cell.border
+            cell.border = Border(top=thin, left=b.left, right=b.right, bottom=b.bottom)
+    
+    # 下辺
+    if border_type in ['line_h', 'all', 'box']:
+        for c in range(c_start, c_end + 1):
+            cell = ws.cell(row=r_end, column=c)
+            b = cell.border
+            cell.border = Border(top=b.top, left=b.left, right=b.right, bottom=thin)
 
-def get_master_cell(ws, cell):
-    """結合セルの場合、その親（左上）のセルを返す"""
-    if isinstance(cell, MergedCell):
-        for merged_range in ws.merged_cells.ranges:
-            if cell.coordinate in merged_range:
-                return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
-    return cell
+    # 左辺
+    if border_type in ['line_v', 'all', 'box']:
+        for r in range(r_start, r_end + 1):
+            cell = ws.cell(row=r, column=c_start)
+            b = cell.border
+            cell.border = Border(top=b.top, left=thin, right=b.right, bottom=b.bottom)
+
+    # 右辺
+    if border_type in ['line_v', 'all', 'box']:
+        for r in range(r_start, r_end + 1):
+            cell = ws.cell(row=r, column=c_end)
+            b = cell.border
+            cell.border = Border(top=b.top, left=b.left, right=thin, bottom=b.bottom)
+
 
 def generate_excel(all_pages_elements, output_path, tolerance=30.0, dpi=300):
     wb = Workbook()
@@ -99,148 +68,171 @@ def generate_excel(all_pages_elements, output_path, tolerance=30.0, dpi=300):
         ws = wb.create_sheet(title=f"Page {page_num}")
         print(f"Generating Sheet: Page {page_num}...")
 
-        # --- 1. グリッド生成 ---
+        # --- 1. グリッド座標の抽出 ---
         x_coords = set()
         y_coords = set()
-        page_w = 0
         
+        # ページサイズ
+        page_w, page_h = 0, 0
         for el in elements:
             if el['type'] == 'page_size':
-                page_w = el['width']
+                page_w, page_h = el['width'], el['height']
                 x_coords.add(0); x_coords.add(page_w)
-                y_coords.add(0); y_coords.add(el['height'])
-            elif el['type'] in ['line_h', 'line_v']:
-                x_coords.add(el['x0']); x_coords.add(el['x1'])
+                y_coords.add(0); y_coords.add(page_h)
+        
+        # 罫線座標
+        lines = [el for el in elements if el['type'] in ['line_h', 'line_v']]
+        for el in lines:
+            if el['type'] == 'line_h':
                 y_coords.add(el['top']); y_coords.add(el['bottom'])
-            elif el['type'] == 'text':
-                x_coords.add(el['x0'])
-                y_coords.add(el['top'])
-
-        if page_w == 0:
-             x_coords.add(0); x_coords.add(2000)
-             y_coords.add(0); y_coords.add(2000)
+                # 横線の端点も重要
+                x_coords.add(el['x0']); x_coords.add(el['x1'])
+            elif el['type'] == 'line_v':
+                x_coords.add(el['x0']); x_coords.add(el['x1'])
+                # 縦線の端点も重要
+                y_coords.add(el['top']); y_coords.add(el['bottom'])
 
         cols = cluster_coords(x_coords, tolerance)
         rows = cluster_coords(y_coords, tolerance)
         
-        cols, rows = optimize_grid(cols, rows, elements, tolerance)
-        print(f"  - Final Grid: {len(rows)} rows x {len(cols)} columns")
+        print(f"  - Grid: {len(rows)} rows x {len(cols)} columns")
 
-        # --- 2. 配置 ---
+        # --- 2. 罫線の描画 ---
+        # 罫線の位置にあるセルの境界に線を引く
+        for el in lines:
+            # 線がどのグリッド範囲をカバーしているか
+            c_start = bisect.bisect_left(cols, el['x0'] + 2) - 1
+            c_end   = bisect.bisect_left(cols, el['x1'] - 2) - 1
+            r_start = bisect.bisect_left(rows, el['top'] + 2) - 1
+            r_end   = bisect.bisect_left(rows, el['bottom'] - 2) - 1
+            
+            c_start = max(0, c_start)
+            c_end = min(len(cols)-2, c_end)
+            r_start = max(0, r_start)
+            r_end = min(len(rows)-2, r_end)
+
+            if c_end < c_start: c_end = c_start
+            if r_end < r_start: r_end = r_start
+
+            # Excelの行・列番号（1-based）
+            # line_hなら上下、line_vなら左右に線を引く
+            apply_border_to_range(ws, r_start+1, c_start+1, r_end+1, c_end+1, el['type'])
+
+        # --- 3. テキストの配置 ---
+        # 結合状態を管理（セットには (row, col) を入れる）
         occupied_cells = set()
-        col_max_chars = {}
+        
+        text_elements = sorted([e for e in elements if e['type'] == 'text'], key=lambda x: (x['top'], x['x0']))
 
-        # テキスト優先でソート
-        sorted_elements = sorted(elements, key=lambda x: 0 if x['type'] == 'text' else 1)
-
-        for el in sorted_elements:
-            if el['type'] == 'page_size': continue
-
-            if el['type'] == 'text':
-                cx, cy = el['x0'] + 2, (el['top'] + el['bottom']) / 2
-            else:
-                cx, cy = (el['x0'] + el['x1']) / 2, (el['top'] + el['bottom']) / 2
-
-            c_idx = bisect.bisect_left(cols, cx) - 1
+        for el in text_elements:
+            # テキストの中心点
+            cx = (el['x0'] + el['x1']) / 2
+            cy = (el['top'] + el['bottom']) / 2
+            
+            # 中心点が属するセルを特定
             r_idx = bisect.bisect_left(rows, cy) - 1
+            c_idx = bisect.bisect_left(cols, cx) - 1
             
-            c_idx = max(0, min(c_idx, len(cols) - 2))
-            r_idx = max(0, min(r_idx, len(rows) - 2))
+            if r_idx < 0 or r_idx >= len(rows)-1: continue
+            if c_idx < 0 or c_idx >= len(cols)-1: continue
             
-            excel_c, excel_r = c_idx + 1, r_idx + 1
+            excel_r = r_idx + 1
+            excel_c = c_idx + 1
 
-            # --- テキスト処理 ---
-            if el['type'] == 'text':
-                safe_text = clean_text(el['text'])
-                text_len = sum([2 if ord(c) > 256 else 1 for c in safe_text])
-                col_max_chars[excel_c] = max(col_max_chars.get(excel_c, 0), text_len)
-
-                # 結合判定
-                text_right = el['x1']
-                cell_right = cols[c_idx + 1]
-                c_span = 0
+            # --- 結合範囲の自動拡張 ---
+            # テキストの幅が現在のセル幅を超えていて、かつ「罫線をまたがない」なら結合する
+            # つまり、隣のセルとの境界に物理的な罫線(lines)が存在しないかチェックする
+            
+            merge_c_end = c_idx
+            
+            # 右方向に拡張チェック
+            current_right_x = cols[c_idx+1]
+            target_right_x = el['x1']
+            
+            while current_right_x < target_right_x - tolerance:
+                # 次の境界線 (cols[merge_c_end+1]) に縦線があるかチェック
+                boundary_x = cols[merge_c_end+1]
                 
-                if text_right > cell_right + tolerance:
-                    span_end_idx = bisect.bisect_left(cols, text_right - tolerance) - 1
-                    possible_span = max(0, span_end_idx - c_idx)
-                    
-                    is_safe_merge = True
-                    for k in range(1, possible_span + 1):
-                        if (excel_r, excel_c + k) in occupied_cells:
-                            is_safe_merge = False
-                            break
-                    if is_safe_merge:
-                        c_span = possible_span
-
-                cell_key = (excel_r, excel_c)
+                # このX座標付近に、現在の行の高さをカバーする縦線があるか？
+                has_border = False
+                for line in lines:
+                    if line['type'] == 'line_v':
+                        if abs(line['x0'] - boundary_x) < tolerance:
+                            # 線のY範囲が、現在の行のY範囲と重なるか
+                            l_top, l_btm = line['top'], line['bottom']
+                            cell_top, cell_btm = rows[r_idx], rows[r_idx+1]
+                            if not (l_btm < cell_top or l_top > cell_btm):
+                                has_border = True
+                                break
                 
+                if has_border:
+                    break # 罫線があるのでこれ以上右には結合しない
+                
+                merge_c_end += 1
+                if merge_c_end >= len(cols)-1: break
+                current_right_x = cols[merge_c_end+1]
+            
+            excel_c_end = merge_c_end + 1
+            
+            # --- 結合実行 ---
+            # 既存の結合と重ならないかチェック
+            is_blocked = False
+            for c in range(excel_c, excel_c_end + 1):
+                if (excel_r, c) in occupied_cells:
+                    is_blocked = True
+                    break
+            
+            if (excel_c_end > excel_c) and (not is_blocked):
                 try:
-                    cell = ws.cell(row=excel_r, column=excel_c)
-                    
-                    # ★修正ポイント: MergedCell対策
-                    # 既に結合されているセルに当たった場合、その親を探して追記する
-                    if isinstance(cell, MergedCell):
-                        master = get_master_cell(ws, cell)
-                        if master.value:
-                            master.value = str(master.value) + " " + safe_text
-                        else:
-                            master.value = safe_text
-                    else:
-                        # 通常セルの場合
-                        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+                    # openpyxlの既存結合チェック
+                    conflict = False
+                    for rng in ws.merged_cells.ranges:
+                        if not (excel_r > rng.max_row or excel_r < rng.min_row or 
+                                excel_c > rng.max_col or excel_c_end < rng.min_col):
+                            conflict = True
+                            break
+                    if not conflict:
+                        ws.merge_cells(start_row=excel_r, start_column=excel_c,
+                                       end_row=excel_r, end_column=excel_c_end)
+                        # 占有フラグ更新
+                        for c in range(excel_c, excel_c_end + 1):
+                            occupied_cells.add((excel_r, c))
+                except: pass
 
-                        if cell_key in occupied_cells:
-                            # 自分が開始点だが既にデータがある場合（追記）
-                            if cell.value: cell.value = str(cell.value) + " " + safe_text
-                            else: cell.value = safe_text
-                        else:
-                            # 新規書き込み
-                            cell.value = safe_text
-                            occupied_cells.add(cell_key)
-                            
-                            # 結合実行
-                            if c_span > 0:
-                                ws.merge_cells(start_row=excel_r, start_column=excel_c,
-                                               end_row=excel_r, end_column=excel_c + c_span)
-                                for k in range(1, c_span + 1):
-                                    occupied_cells.add((excel_r, excel_c + k))
-                                    
-                except Exception as e:
-                    print(f"    [Warning] Cell write error at {excel_r},{excel_c}: {e}")
+            # --- 書き込み ---
+            # 結合セルの場合、左上がターゲット。ただし既に占有されている場合は親を探す必要があるが
+            # 上記ロジックでブロックしているので基本は左上でOK。
+            # ただし、同じセルに複数のテキストが入る場合（改行など）の考慮が必要。
+            
+            # 書き込み先セル（結合されていれば親セル）
+            target_cell = ws.cell(row=excel_r, column=excel_c)
+            # もしこのセルが結合範囲の一部（左上以外）なら親を探す
+            for rng in ws.merged_cells.ranges:
+                if (rng.min_row <= excel_r <= rng.max_row) and (rng.min_col <= excel_c <= rng.max_col):
+                    target_cell = ws.cell(row=rng.min_row, column=rng.min_col)
+                    break
+            
+            txt = clean_text(el['text'])
+            if target_cell.value:
+                target_cell.value = str(target_cell.value) + "\n" + txt
+            else:
+                target_cell.value = txt
+            
+            target_cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='left')
 
-            # --- 罫線処理 ---
-            elif el['type'] in ['line_h', 'line_v']:
-                c_start_idx = bisect.bisect_left(cols, el['x0'] - tolerance) - 1
-                c_end_idx = bisect.bisect_left(cols, el['x1'] - tolerance) - 1
-                r_start_idx = bisect.bisect_left(rows, el['top'] - tolerance) - 1
-                r_end_idx = bisect.bisect_left(rows, el['bottom'] - tolerance) - 1
-                
-                c_start_idx = max(0, c_start_idx)
-                c_end_idx = min(len(cols)-2, c_end_idx)
-                r_start_idx = max(0, r_start_idx)
-                r_end_idx = min(len(rows)-2, r_end_idx)
-                
-                if c_end_idx < c_start_idx: c_end_idx = c_start_idx
-                if r_end_idx < r_start_idx: r_end_idx = r_start_idx
-
-                for r in range(r_start_idx, r_end_idx + 1):
-                    for c in range(c_start_idx, c_end_idx + 1):
-                        apply_border_safe(ws, r+1, c+1, el['type'])
-
-        # --- サイズ調整 ---
+        # --- 4. 列幅・行高 ---
         for i in range(len(cols) - 1):
             w_px = cols[i+1] - cols[i]
-            w_base = w_px * scale_factor * 0.14
-            w_text = col_max_chars.get(i+1, 0) * 1.3
-            final_w = max(w_base, w_text)
-            ws.column_dimensions[get_column_letter(i+1)].width = min(final_w, 60)
+            # 係数を調整してExcelの見た目に近づける
+            width = max(w_px * scale_factor * 0.11, 2)
+            ws.column_dimensions[get_column_letter(i+1)].width = min(width, 80)
 
         for i in range(len(rows) - 1):
             h_px = rows[i+1] - rows[i]
-            ws.row_dimensions[i+1].height = max(h_px * scale_factor, 13.5)
+            ws.row_dimensions[i+1].height = max(h_px * scale_factor * 0.75, 13.5)
 
     try:
         wb.save(output_path)
         print(f"\nSaved Excel to: {output_path}")
     except PermissionError:
-        print(f"\n[Error] Could not save to {output_path}. Please close the file in Excel and try again.")
+        print(f"\n[Error] Could not save to {output_path}. Please close the file.")

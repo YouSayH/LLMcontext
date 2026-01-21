@@ -12,7 +12,8 @@ except ImportError:
 def detect_lines(image_np):
     """
     OpenCVを使って画像から「水平線」と「垂直線」を検出する
-    ★修正点: 検出後に太い線を「中心線」に補正して、二重線（四角認識）を防ぎます。
+    ・中心線補正: 太い線を1本の線にする
+    ・ノイズ除去: 短すぎる線を無視する
     """
     if len(image_np.shape) == 3:
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
@@ -25,77 +26,76 @@ def detect_lines(image_np):
     elements = []
     h_img, w_img = image_np.shape[:2]
 
-    # --- ユーザー指定の閾値 ---
-    min_w_len = w_img // 10
-    min_h_len = h_img // 20
+    # --- 1. 閾値の設定（調整済み） ---
+    # 元は // 10 でしたが、細かい表の線を拾えるように少し緩くします
+    min_w_len = w_img // 20  
+    min_h_len = h_img // 30
 
     # --- A. 横線の検出 ---
+    # 横長の構造要素で抽出
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_w_len, 1))
     h_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
 
-    # 途切れ対策: 縦に膨張させて結合
-    kernel_h_join = np.ones((5, 1), np.uint8)
+    # 途切れ対策: 縦に少し膨張させて結合
+    kernel_h_join = np.ones((4, 1), np.uint8)
     h_lines_img = cv2.dilate(h_lines_img, kernel_h_join, iterations=1)
 
     cnts, _ = cv2.findContours(h_lines_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
-        if w >= min_w_len:
-            # ▼▼▼ 修正: 中心線（芯）をとる ▼▼▼
-            # 太い線として検出されても、中心のY座標を使って「細い線」として登録する
-            center_y = y + h // 2
-            # 上下1pxずつの幅2pxの線として定義しなおす
-            new_top = center_y - 1
-            new_bottom = center_y + 1
-            
-            elements.append(
-                {
-                    "type": "line_h",
-                    "x0": x,
-                    "top": new_top,      # 修正済み座標
-                    "x1": x + w,
-                    "bottom": new_bottom, # 修正済み座標
-                    "width": w,
-                    "height": 2,          # 高さを強制的に2pxにする
-                }
-            )
+        
+        # 【追加】ノイズ除去: 極端に短い線（例えば50px未満）は無視
+        if w < 50:
+            continue
+
+        # 中心線（芯）をとる
+        center_y = y + h // 2
+        elements.append(
+            {
+                "type": "line_h",
+                "x0": x,
+                "top": center_y - 1,
+                "x1": x + w,
+                "bottom": center_y + 1,
+                "width": w,
+                "height": 2, # 強制的に細くする
+            }
+        )
 
     # --- B. 縦線の検出 ---
+    # 縦長の構造要素で抽出
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_h_len))
     v_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
 
-    # 途切れ対策: 横に膨張させて結合
-    kernel_v_join = np.ones((1, 5), np.uint8)
+    # 途切れ対策: 横に少し膨張させて結合
+    kernel_v_join = np.ones((1, 4), np.uint8)
     v_lines_img = cv2.dilate(v_lines_img, kernel_v_join, iterations=1)
 
     cnts, _ = cv2.findContours(v_lines_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
-        if h >= min_h_len:
-            # ▼▼▼ 修正: 中心線（芯）をとる ▼▼▼
-            # 太い線として検出されても、中心のX座標を使って「細い線」として登録する
-            center_x = x + w // 2
-            # 左右1pxずつの幅2pxの線として定義しなおす
-            new_x0 = center_x - 1
-            new_x1 = center_x + 1
 
-            elements.append(
-                {
-                    "type": "line_v",
-                    "x0": new_x0,        # 修正済み座標
-                    "top": y,
-                    "x1": new_x1,        # 修正済み座標
-                    "bottom": y + h,
-                    "width": 2,          # 幅を強制的に2pxにする
-                    "height": h,
-                }
-            )
+        # 【追加】ノイズ除去: 極端に短い線は無視
+        if h < 20:
+            continue
 
-    print(
-        f"  - Lines detected: {len(elements)} (threshold w>{min_w_len}, h>{min_h_len})"
-    )
+        # 中心線（芯）をとる
+        center_x = x + w // 2
+        elements.append(
+            {
+                "type": "line_v",
+                "x0": center_x - 1,
+                "top": y,
+                "x1": center_x + 1,
+                "bottom": y + h,
+                "width": 2, # 強制的に細くする
+                "height": h,
+            }
+        )
+
+    print(f"  - Lines detected: {len(elements)}")
     return elements
 
 
@@ -177,7 +177,6 @@ def analyze_page(image_np):
 def save_debug_image(image_np, elements, output_path):
     """
     解析結果（テキスト・罫線）を画像に描画して保存する
-    OpenCVは BGR 形式なので、赤色は (0, 0, 255) です。
     """
     # 元画像を汚さないようにコピーを作成
     debug_img = image_np.copy()
@@ -190,12 +189,11 @@ def save_debug_image(image_np, elements, output_path):
         x1, y1 = int(el['x1']), int(el['bottom'])
 
         if el['type'] == 'text':
-            # ★ テキストを赤枠 (Blue=0, Green=0, Red=255) に設定
+            # テキストを赤枠
             cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 0, 255), 2)
             
         elif el['type'] in ['line_h', 'line_v']:
-            # 罫線は区別しやすいように緑色 (Blue=0, Green=255, Red=0) に設定
-            # 補正後の細い線が描画されるため、太い黒線の「真ん中」に細い緑線が引かれます
+            # 罫線は緑枠
             cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 0), 2)
 
     import os

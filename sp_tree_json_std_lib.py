@@ -119,6 +119,13 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
    # -> 機能改修の影響範囲を調査する時に強力（要 networkx）
    python sp_tree_json_std_lib.py --focus "User" --resolve-deps
 
+   # ファイル名で絞り込み（utils.py の中の save 関数だけ抽出）
+   python sp_tree_json_std_lib.py --focus "utils.py:save"
+
+
+   # scrフォルダのmainがファイル名、main関数などが入っているファイルの関係ファイルを持ってくる。
+   python sp_tree_json_std_lib.py --focus "scr:main" --resolve-deps -o result.json
+
    # "FIXME" という単語を含む箇所を抽出してコピー
    python sp_tree_json_std_lib.py --focus "FIXME" --copy
 
@@ -131,6 +138,8 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
 
    # .py と .md だけ中身を表示し、他は除外（ツリーにも出さない）
    python sp_tree_json_std_lib.py --preview-exts .py .md
+
+   python .\sp_tree_json_std_lib.py -p "Path" -e *.sql *.md *.yaml *.txt *.xlsx *.bat *zip *.dic *.toml *.csv *yml .env *.db .env.example tools tests *.ps1 *.json Rehab_RAG "PTガイドライン&Excel版書式(リハビリテーション総合実施計画書)" output nginx logs create .ruff_cache .pytest_cache .history __pycache__ *html 1_generate.py db_viewer.py debug_parser.py evaluate_extraction_accuracy.py rehab_db_viewer.py レイアウト.html style.css static -o context1.json
 """
 
 import os
@@ -521,17 +530,53 @@ def main():
                 # 読み込み失敗やサイズ超過時は空文字（存在は残す）
                 file_map[fpath] = ""
 
-    # Focus & Deps logic
-    final_targets = set(file_map.keys())
-    if args.focus:
-        # Focusモード時の絞り込み
-        focus_roots = [p for p, c in file_map.items() if args.focus in p.name or args.focus in c]
+    # # Focus & Deps logic
+    # final_targets = set(file_map.keys())
+    # if args.focus:
+    #     # Focusモード時の絞り込み
+    #     focus_roots = [p for p, c in file_map.items() if args.focus in p.name or args.focus in c]
         
+    #     if args.resolve_deps and HAS_NETWORKX:
+    #         G = build_dependency_graph(file_map, args.debug)
+    #         final_targets = get_related_files(focus_roots, G)
+    #     else:
+    #         final_targets = set(focus_roots)
+    final_targets = set(file_map.keys())
+    
+    # ▼▼▼ 修正：ファイル名によるスコープ絞り込み機能を追加 ▼▼▼
+    focus_keyword = args.focus
+    path_filter = None
+
+    if args.focus:
+        # "filename:keyword" の形式なら分割する
+        if ":" in args.focus:
+            parts = args.focus.split(":")
+            # 単純な分割だと Windowsパス(C:\...)と競合する可能性がゼロではないが、
+            # 引数指定の文脈ではほぼファイルフィルタとして機能する
+            if len(parts) == 2 and parts[0] and parts[1]:
+                path_filter = parts[0]    # 例: "app.py" や "src"
+                focus_keyword = parts[1]  # 例: "main"
+
+        # 絞り込みロジック
+        focus_roots = []
+        for p, c in file_map.items():
+            # 1. パスフィルタがある場合、パスに含まれていなければスキップ
+            if path_filter and (path_filter not in str(p).replace(os.sep, '/')):
+                continue
+
+            # 2. キーワードがファイル名か中身に含まれているか
+            #    (Tree-sitter抽出用にはファイル全体を対象に残す必要がある)
+            if focus_keyword in p.name or focus_keyword in c:
+                focus_roots.append(p)
+
         if args.resolve_deps and HAS_NETWORKX:
             G = build_dependency_graph(file_map, args.debug)
             final_targets = get_related_files(focus_roots, G)
         else:
             final_targets = set(focus_roots)
+            
+        # extract処理用に引数を書き換えておく（抽出関数にはキーワードだけ渡すため）
+        args.focus = focus_keyword
 
     # Build Tree
     def build_tree(current_path):
