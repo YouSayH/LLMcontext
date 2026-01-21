@@ -56,6 +56,9 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
   -e, --exclude PATTERNS...   除外するファイル/フォルダのパターン (例: "*.log" "tmp*")
                               ※ デフォルトで .git, node_modules, venv, __pycache__ 等は除外済
                               ※ 追加指定してもデフォルト設定は維持されます
+
+  --use-gitignore            .gitignoreの記述を解析し、除外リストに追加されます。
+
   --git-filter MODE           Gitの状態に基づいて絞り込み
                               [モード]
                               - None     : フィルタなし (デフォルト)
@@ -122,6 +125,8 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
    # ファイル名で絞り込み（utils.py の中の save 関数だけ抽出）
    python sp_tree_json_std_lib.py --focus "utils.py:save"
 
+   # .gitignoreの内容を除外し、結果をクリップボードに持つ。
+   python sp_tree_json_std_lib.py --use-gitignore --copy
 
    # scrフォルダのmainがファイル名、main関数などが入っているファイルの関係ファイルを持ってくる。
    python sp_tree_json_std_lib.py --focus "scr:main" --resolve-deps -o result.json
@@ -245,6 +250,7 @@ def parse_args():
     parser.add_argument('--copy', '-c', action='store_true', help='クリップボードにコピー (要pyperclip)')
     parser.add_argument('--model', default='gpt-4o', help='トークン計算モデル (要tiktoken)')
     parser.add_argument('--debug', action='store_true', help='デバッグログ')
+    parser.add_argument('--use-gitignore', action='store_true', help='.gitignoreのパターンを除外リストに追加')
 
     return parser.parse_args()
 
@@ -492,11 +498,37 @@ def read_content(path: Path) -> Optional[str]:
             continue
     return None
 
+def load_gitignore_patterns(root_path: Path) -> List[str]:
+    """ .gitignoreを読み込み、fnmatch用のパターンリストを返す """
+    patterns = []
+    gitignore_path = root_path / '.gitignore'
+    
+    if gitignore_path.exists():
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    # fnmatchはパス区切り(/)を厳密に扱わないため、
+                    # 先頭や末尾の/を除去して単純なパターンにする
+                    clean_pattern = line.strip('/')
+                    patterns.append(clean_pattern)
+        except Exception:
+            pass
+    return patterns
+
 def main():
     args = parse_args()
+    root_path = Path(args.path).resolve()
+
+    if args.use_gitignore:
+        git_patterns = load_gitignore_patterns(root_path)
+        args.exclude.extend(git_patterns)
+        log_debug(f"Loaded .gitignore patterns: {git_patterns}", args.debug)
+
     if args.exclude != DEFAULT_EXCLUDES:
         args.exclude = list(set(args.exclude + DEFAULT_EXCLUDES))
-    root_path = Path(args.path).resolve()
     
     # Check dependencies for debug
     if args.debug:
