@@ -42,7 +42,7 @@ def main():
     print("\n=== Step 3: Generating Excel ===")
     # グリッドの吸着強度（許容誤差）
     # 画像サイズが大きい(3500px)ので、15px〜20pxくらいのズレは許容しないと行が増えすぎます
-    generate_excel(all_pages_elements, output_xlsx, tolerance=15.0)
+    generate_excel(all_pages_elements, output_xlsx, tolerance=50.0)
 
     print("\nAll done! Please check the output file.")
 

@@ -410,23 +410,29 @@ def extract_code_block_braces(code: str, keyword: str) -> Optional[str]:
 def get_git_files(root_path: Path, mode: str) -> Set[str]:
     files = set()
     cmds = []
+    
+    # -z オプションを追加して、エスケープを無効化（NULL文字区切りにする）
     if mode == 'Tracked':
-        cmds = [['git', 'ls-files']]
+        cmds = [['git', 'ls-files', '-z']]
     elif mode == 'Staged':
-        cmds = [['git', 'diff', '--name-only', '--cached']]
+        cmds = [['git', 'diff', '--name-only', '--cached', '-z']]
     elif mode == 'Modified':
         cmds = [
-            ['git', 'diff', '--name-only'],
-            ['git', 'diff', '--name-only', '--cached'],
-            ['git', 'ls-files', '--others', '--exclude-standard']
+            ['git', 'diff', '--name-only', '-z'],
+            ['git', 'diff', '--name-only', '--cached', '-z'],
+            ['git', 'ls-files', '--others', '--exclude-standard', '-z']
         ]
     
     for cmd in cmds:
         try:
+            # -z を使う場合、encodingはそのままでOKだが、区切り処理を変える
             res = subprocess.run(cmd, cwd=root_path, capture_output=True, text=True, encoding='utf-8')
             if res.returncode == 0:
-                for line in res.stdout.splitlines():
+                # splitlines() ではなく split('\0') で分割する
+                # 末尾に空文字が入ることがあるのでフィルタする
+                for line in res.stdout.split('\0'):
                     if line.strip():
+                        # Pathとして解決
                         files.add(str((root_path / line.strip()).resolve()))
         except Exception:
             pass

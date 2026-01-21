@@ -12,6 +12,7 @@ except ImportError:
 def detect_lines(image_np):
     """
     OpenCVを使って画像から「水平線」と「垂直線」を検出する
+    ★修正点: 検出後に太い線を「中心線」に補正して、二重線（四角認識）を防ぎます。
     """
     if len(image_np.shape) == 3:
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
@@ -24,47 +25,70 @@ def detect_lines(image_np):
     elements = []
     h_img, w_img = image_np.shape[:2]
 
-    # --- ユーザー指定の閾値（かなり大きめ） ---
-    # 画像の端にある枠線などを確実に拾うため、あるいは大枠だけ拾うための設定
+    # --- ユーザー指定の閾値 ---
     min_w_len = w_img // 10
     min_h_len = h_img // 20
 
     # --- A. 横線の検出 ---
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_w_len, 1))
     h_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
+
+    # 途切れ対策: 縦に膨張させて結合
+    kernel_h_join = np.ones((5, 1), np.uint8)
+    h_lines_img = cv2.dilate(h_lines_img, kernel_h_join, iterations=1)
+
     cnts, _ = cv2.findContours(h_lines_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         if w >= min_w_len:
+            # ▼▼▼ 修正: 中心線（芯）をとる ▼▼▼
+            # 太い線として検出されても、中心のY座標を使って「細い線」として登録する
+            center_y = y + h // 2
+            # 上下1pxずつの幅2pxの線として定義しなおす
+            new_top = center_y - 1
+            new_bottom = center_y + 1
+            
             elements.append(
                 {
                     "type": "line_h",
                     "x0": x,
-                    "top": y,
+                    "top": new_top,      # 修正済み座標
                     "x1": x + w,
-                    "bottom": y + h,
+                    "bottom": new_bottom, # 修正済み座標
                     "width": w,
-                    "height": h,
+                    "height": 2,          # 高さを強制的に2pxにする
                 }
             )
 
     # --- B. 縦線の検出 ---
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_h_len))
     v_lines_img = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
+
+    # 途切れ対策: 横に膨張させて結合
+    kernel_v_join = np.ones((1, 5), np.uint8)
+    v_lines_img = cv2.dilate(v_lines_img, kernel_v_join, iterations=1)
+
     cnts, _ = cv2.findContours(v_lines_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         if h >= min_h_len:
+            # ▼▼▼ 修正: 中心線（芯）をとる ▼▼▼
+            # 太い線として検出されても、中心のX座標を使って「細い線」として登録する
+            center_x = x + w // 2
+            # 左右1pxずつの幅2pxの線として定義しなおす
+            new_x0 = center_x - 1
+            new_x1 = center_x + 1
+
             elements.append(
                 {
                     "type": "line_v",
-                    "x0": x,
+                    "x0": new_x0,        # 修正済み座標
                     "top": y,
-                    "x1": x + w,
+                    "x1": new_x1,        # 修正済み座標
                     "bottom": y + h,
-                    "width": w,
+                    "width": 2,          # 幅を強制的に2pxにする
                     "height": h,
                 }
             )
@@ -133,7 +157,6 @@ def analyze_page(image_np):
     texts = run_ocr(image_np)
 
     # 画像サイズ情報を「特別な要素」として追加
-    # これをStep 3で受け取って、外枠グリッドを作るのに使います
     h, w = image_np.shape[:2]
     page_info = [
         {
@@ -143,7 +166,7 @@ def analyze_page(image_np):
             "x0": 0,
             "top": 0,
             "x1": w,
-            "bottom": h,  # ダミー座標
+            "bottom": h,
         }
     ]
 
@@ -151,10 +174,47 @@ def analyze_page(image_np):
     return raw_lines + texts + page_info
 
 
+def save_debug_image(image_np, elements, output_path):
+    """
+    解析結果（テキスト・罫線）を画像に描画して保存する
+    OpenCVは BGR 形式なので、赤色は (0, 0, 255) です。
+    """
+    # 元画像を汚さないようにコピーを作成
+    debug_img = image_np.copy()
+
+    for el in elements:
+        if el['type'] == 'page_size':
+            continue
+
+        x0, y0 = int(el['x0']), int(el['top'])
+        x1, y1 = int(el['x1']), int(el['bottom'])
+
+        if el['type'] == 'text':
+            # ★ テキストを赤枠 (Blue=0, Green=0, Red=255) に設定
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 0, 255), 2)
+            
+        elif el['type'] in ['line_h', 'line_v']:
+            # 罫線は区別しやすいように緑色 (Blue=0, Green=255, Red=0) に設定
+            # 補正後の細い線が描画されるため、太い黒線の「真ん中」に細い緑線が引かれます
+            cv2.rectangle(debug_img, (x0, y0), (x1, y1), (0, 255, 0), 2)
+
+    import os
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, debug_img)
+    print(f"  [Debug] Saved visualization to: {output_path}")
+
+
 if __name__ == "__main__":
     target_pdf = "ts.pdf"
     print("--- Step 1: Converting ---")
+    
     page_data_list = convert_all_pages_to_numpy(target_pdf)
+    
     if page_data_list:
-        print("\n--- Step 2: Analyzing ---")
-        analyze_page(page_data_list[0][1])
+        print("\n--- Step 2: Analyzing & Visualizing ---")
+        
+        for page_num, img_array in page_data_list:
+            print(f"Processing Page {page_num}...")
+            elements = analyze_page(img_array)
+            output_filename = f"debug_analyzed/page_{page_num:02d}_result.png"
+            save_debug_image(img_array, elements, output_filename)
