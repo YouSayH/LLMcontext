@@ -42,6 +42,7 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
   -o, --outfile FILE          結果を指定ファイルに出力 (未指定時は標準出力)
   -c, --copy                  結果をクリップボードにコピー (要 pyperclip)
   --debug                     デバッグログを表示
+  --tree                      tree構造で表示
 
 2. 構造・プレビュー制御 (出力内容の調整)
   --directories-only          ファイルを含めず、ディレクトリ構造のみを出力
@@ -143,6 +144,13 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
 
    # .py と .md だけ中身を表示し、他は除外（ツリーにも出さない）
    python sp_tree_json_std_lib.py --preview-exts .py .md
+
+   # フィルタ(-e)で指定されたもの以外、全てのファイル・フォルダをツリー表示
+   # 中身の読み込みは発生しません
+   python sp_tree_json_std_lib.py --tree
+
+   # ファイルを隠してフォルダのみ表示
+   python sp_tree_json_std_lib.py --tree --directories-only
 
    python .\sp_tree_json_std_lib.py -p "Path" -e *.sql *.md *.yaml *.txt *.xlsx *.bat *zip *.dic *.toml *.csv *yml .env *.db .env.example tools tests *.ps1 *.json Rehab_RAG "PTガイドライン&Excel版書式(リハビリテーション総合実施計画書)" output nginx logs create .ruff_cache .pytest_cache .history __pycache__ *html 1_generate.py db_viewer.py debug_parser.py evaluate_extraction_accuracy.py rehab_db_viewer.py レイアウト.html style.css static -o context1.json
 """
@@ -251,6 +259,8 @@ def parse_args():
     parser.add_argument('--model', default='gpt-4o', help='トークン計算モデル (要tiktoken)')
     parser.add_argument('--debug', action='store_true', help='デバッグログ')
     parser.add_argument('--use-gitignore', action='store_true', help='.gitignoreのパターンを除外リストに追加')
+
+    parser.add_argument('--tree', action='store_true', help='視覚的なツリー形式で出力（ファイルの中身は省略されます）')
 
     return parser.parse_args()
 
@@ -518,9 +528,45 @@ def load_gitignore_patterns(root_path: Path) -> List[str]:
             pass
     return patterns
 
+
+def print_visual_tree(node, prefix="", is_last=True):
+    """
+    JSON構造を再帰的に走査して、視覚的なツリーを表示する。
+    """
+    connector = "└──" if is_last else "├──"
+
+
+    name = node['name']
+    # "children" キーを持っている＝ディレクトリとみなして / を付与
+    if "children" in node:
+        name += "/"
+        
+    print(f"{prefix}{connector}{name}")
+
+    
+    # 子要素を取得
+    children = node.get("children", [])
+    
+    # 最後の要素かどうか判定しながら再帰
+    new_prefix = prefix + ("    " if is_last else "│   ")
+    for i, child in enumerate(children):
+        print_visual_tree(child, new_prefix, i == len(children) - 1)
+
 def main():
     args = parse_args()
     root_path = Path(args.path).resolve()
+
+    if args.tree:
+        # 1. プレビュー対象拡張子を空にする (＝中身を読み込むファイルをゼロにする)
+        args.preview_exts = []
+        
+        # 2. プレビュー対象外のファイルもツリーに含める設定をONにする
+        #    これにより、フィルタ(-e)で除外されていない全ファイルが「中身なし」として登録される
+        args.include_non_preview = True
+        
+        # 3. Focusモード（中身検索）はTree表示と相性が悪いため無効化しておく
+        #    (ファイル名検索として機能させるなら残しても良いが、誤解を避けるためOFF推奨)
+        args.focus = None 
 
     if args.use_gitignore:
         git_patterns = load_gitignore_patterns(root_path)
@@ -676,6 +722,20 @@ def main():
     # Output
     if root_node:
         try:
+
+            if args.tree:
+                
+                # ルートディレクトリ名を表示 (ディレクトリらしさを出すため / を付与)
+                print(f"{root_node['name']}/")
+                
+                # ルート直下の子要素に対して再帰表示を実行
+                children = root_node.get("children", [])
+                for i, child in enumerate(children):
+                    is_last = (i == len(children) - 1)
+                    print_visual_tree(child, prefix="", is_last=is_last)
+                
+                return # ツリー表示だけして終了
+            
             json_str = json.dumps(root_node, ensure_ascii=False, indent=None, separators=(',', ':'))
             
             # Token Count
