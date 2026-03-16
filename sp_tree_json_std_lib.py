@@ -9,7 +9,7 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
 1. ポータビリティ: 標準ライブラリのみで動作（最小構成）。
 2. 高機能モード: ライブラリ追加で「正確なコード抽出」「依存関係解決」「トークン計算」が有効化。
 3. 柔軟な出力: 
-   - 「全ファイルのフルコンテキスト」
+   - 「全ファイルのフルコンテキスト（JSON / Markdown風テキスト）」
    - 「ディレクトリ構造のみ」
    - 「ファイル構成図（中身なし）」
    など、目的に応じて出力を調整可能。
@@ -43,6 +43,7 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
   -c, --copy                  結果をクリップボードにコピー (要 pyperclip)
   --debug                     デバッグログを表示
   --tree                      tree構造で表示
+  --text                      Markdown風のテキスト形式で出力（トークン節約）
 
 2. 構造・プレビュー制御 (出力内容の調整)
   --directories-only          ファイルを含めず、ディレクトリ構造のみを出力
@@ -84,8 +85,14 @@ LLM共有用プロジェクトダンプツール (All-in-One Version)
    # カレントディレクトリの全コードをクリップボードにコピー（最も一般的）
    python sp_tree_json_std_lib.py --copy
 
-   # 結果をファイルに保存
+   # Markdown形式でクリップボードにコピー (JSONよりトークン数を約10%節約)
+   python sp_tree_json_std_lib.py --text --copy
+
+   # 結果をファイルに保存 (JSON形式)
    python sp_tree_json_std_lib.py -o context.json
+
+   # 結果をファイルに保存 (Markdown形式)
+   python sp_tree_json_std_lib.py --text -o context.md
 
    # 標準出力に表示（パイプ処理などに）
    python sp_tree_json_std_lib.py
@@ -228,7 +235,7 @@ DEFAULT_EXCLUDES = [
     'venv*', '.venv', '.env', '.git', 'node_modules', '__pycache__', '.vscode',
     '_deps', '*.dir', 'x64', '.cache', '.history', '*.pyc', '*.class', 
     'sp_tree_json_std_lib.py', '*.egg-info', 'dist', 'build',
-    ".ruff_cache", ".history", ".json", ".DS_Store", "package-lock.json", "yarn.lock"
+    ".ruff_cache", ".history", ".json", ".DS_Store", "package-lock.json", "yarn.lock",".pytest_cache"
 ]
 
 DEFAULT_PREVIEW_EXTS = [
@@ -254,6 +261,8 @@ def parse_args():
     
     parser.add_argument('--focus', '-f', default=None, help='指定したキーワード(関数名・クラス名)を抽出')
     parser.add_argument('--resolve-deps', action='store_true', help='Focus時、依存ファイルも含める (要networkx)')
+
+    parser.add_argument('--summary-only', action='store_true', help='ファイルの中身の代わりに冒頭の要約コメントのみを出力する')
     
     parser.add_argument('--copy', '-c', action='store_true', help='クリップボードにコピー (要pyperclip)')
     parser.add_argument('--model', default='gpt-4o', help='トークン計算モデル (要tiktoken)')
@@ -262,11 +271,38 @@ def parse_args():
 
     parser.add_argument('--tree', action='store_true', help='視覚的なツリー形式で出力（ファイルの中身は省略されます）')
 
+    parser.add_argument('--text', action='store_true', help='Markdown風のテキスト形式で出力（トークン節約）')
+
     return parser.parse_args()
 
 def log_debug(msg: str, is_debug: bool):
     if is_debug:
         print(f"[DEBUG] {msg}", file=sys.stderr)
+
+# ==========================================
+# 0. Cache Management
+# ==========================================
+CACHE_FILE_NAME = ".context_cache.json"
+
+def load_cache(root_path: Path, is_debug: bool) -> Dict:
+    cache_path = root_path / CACHE_FILE_NAME
+    if cache_path.exists():
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                log_debug(f"Loaded cache from {cache_path}", is_debug)
+                return json.load(f)
+        except Exception as e:
+            log_debug(f"Failed to load cache: {e}", is_debug)
+    return {}
+
+def save_cache(root_path: Path, cache_data: Dict, is_debug: bool):
+    cache_path = root_path / CACHE_FILE_NAME
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        log_debug(f"Saved cache to {cache_path}", is_debug)
+    except Exception as e:
+        log_debug(f"Failed to save cache: {e}", is_debug)
 
 # ==========================================
 # 1. Dependency Analysis (Graph Logic)
@@ -430,6 +466,135 @@ def extract_code_block_braces(code: str, keyword: str) -> Optional[str]:
     return "\n\n".join(extracted) if extracted else None
 
 # ==========================================
+# 3.5. Summary Extraction
+# ==========================================
+def extract_summary(content: str, ext: str, is_debug: bool = False) -> str:
+    """ファイルの冒頭から要約（コメントブロックやdocstring）を抽出する"""
+    log_debug(f"Attempting to extract summary for extension: {ext}", is_debug)
+    content = content.lstrip()
+    
+    # Python docstring (""" または ''')
+    if content.startswith('"""'):
+        match = re.search(r'"""(.*?)"""', content, re.DOTALL)
+        if match:
+            log_debug("Found Python double-quote docstring summary.", is_debug)
+            return match.group(1).strip()
+    if content.startswith("'''"):
+        match = re.search(r"'''(.*?)'''", content, re.DOTALL)
+        if match:
+            log_debug("Found Python single-quote docstring summary.", is_debug)
+            return match.group(1).strip()
+
+    # C-style / CSS multiline (/* ... */)
+    if content.startswith('/*'):
+        match = re.search(r'/\*(.*?)\*/', content, re.DOTALL)
+        if match:
+            log_debug("Found C-style multiline comment summary.", is_debug)
+            return match.group(1).strip()
+
+    # HTML multiline ()
+    if content.startswith('', content, re.DOTALL):
+        if match:
+            log_debug("Found HTML comment summary.", is_debug)
+            return match.group(1).strip()
+
+    # 単一行コメントの連続ブロック (# または //)
+    summary_lines = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if summary_lines: 
+                break # コメントブロックの途中で空行が来たら終了とみなす
+            continue
+        
+        if stripped.startswith('#') or stripped.startswith('//'):
+            # 先頭のコメント記号を消して格納
+            text = re.sub(r'^(#|//+)\s*', '', stripped)
+            summary_lines.append(text)
+        else:
+            if summary_lines:
+                break
+            # コメントでも空行でもない行（実際のコードなど）が来たら即終了
+            break
+            
+    if summary_lines:
+        log_debug(f"Found single-line comment block summary ({len(summary_lines)} lines).", is_debug)
+        return "\n".join(summary_lines)
+        
+    log_debug("No summary block found at the beginning.", is_debug)
+    return ""
+
+# ==========================================
+# 3.6. Tag Extraction (AST / Tree-sitter)
+# ==========================================
+def extract_tags(content: str, ext: str, is_debug: bool = False) -> List[str]:
+    """コードからクラス名や関数名などを抽出し、タグのリストとして返す"""
+    tags = set()
+    
+    # 1. Tree-sitterによる抽出 (多言語対応)
+    if HAS_TREESITTER:
+        lang_name = TREESITTER_EXT_MAP.get(ext)
+        if lang_name:
+            try:
+                parser = get_parser(lang_name)
+                content_bytes = content.encode('utf-8')
+                tree = parser.parse(content_bytes)
+                
+                # 定義とみなすキーワード
+                DEF_KEYWORDS = {'function', 'method', 'class', 'struct', 'interface'}
+                visited = set()
+
+                def visit(node):
+                    if node.id in visited:
+                        return
+                    visited.add(node.id)
+
+                    is_def_type = any(k in node.type for k in DEF_KEYWORDS)
+                    if is_def_type:
+                        name_node = node.child_by_field_name('name')
+                        if name_node:
+                            node_name = content_bytes[name_node.start_byte : name_node.end_byte].decode('utf-8')
+                            tags.add(node_name)
+
+                    for child in node.children:
+                        visit(child)
+
+                visit(tree.root_node)
+                if tags:
+                    log_debug(f"Extracted {len(tags)} tags via Tree-sitter.", is_debug)
+                    return sorted(list(tags))
+            except Exception as e:
+                log_debug(f"Tree-sitter tag extraction failed: {e}", is_debug)
+
+    # 2. Python ASTによる抽出 (フォールバック)
+    if ext == '.py':
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    tags.add(node.name)
+            if tags:
+                log_debug(f"Extracted {len(tags)} tags via AST.", is_debug)
+                return sorted(list(tags))
+        except Exception as e:
+            log_debug(f"AST tag extraction failed: {e}", is_debug)
+
+    # 3. 簡易正規表現による抽出 (他言語用フォールバック)
+    try:
+        patterns = [
+            r'\b(?:class|def|function|struct|interface)\s+([a-zA-Z_][a-zA-Z0-9_]*)'
+        ]
+        for pat in patterns:
+            for match in re.finditer(pat, content):
+                tags.add(match.group(1))
+        if tags:
+            log_debug(f"Extracted {len(tags)} tags via Regex.", is_debug)
+    except Exception:
+        pass
+
+    return sorted(list(tags))
+
+# ==========================================
 # 4. Main Workflow
 # ==========================================
 def get_git_files(root_path: Path, mode: str) -> Set[str]:
@@ -471,6 +636,19 @@ def should_exclude(name: str, excludes: List[str]) -> bool:
 
 def collect_files(root_path: Path, args, git_allowed) -> List[Path]:
     target_files = []
+    
+    # 対象がディレクトリではなく単一ファイルの場合の直接処理
+    if root_path.is_file():
+        log_debug(f"Direct file path provided: {root_path}", args.debug)
+        if should_exclude(root_path.name, args.exclude):
+            return []
+        if git_allowed is not None and str(root_path.resolve()) not in git_allowed:
+            return []
+        ext = root_path.suffix.lower()
+        if (ext in args.preview_exts) or args.include_non_preview:
+            return [root_path]
+        return []
+
     for dirpath, dirnames, filenames in os.walk(root_path):
         # 除外ディレクトリのフィルタリング
         dirnames[:] = [d for d in dirnames if not should_exclude(d, args.exclude)]
@@ -556,6 +734,13 @@ def main():
     args = parse_args()
     root_path = Path(args.path).resolve()
 
+    # キャッシュファイルのロードをメイン関数のスコープに設定
+    global cache_dict
+    cache_dict = load_cache(root_path if root_path.is_dir() else root_path.parent, args.debug)
+    
+    # 自身のキャッシュファイルを除外リストに追加
+    args.exclude.append(CACHE_FILE_NAME)
+
     if args.tree:
         # 1. プレビュー対象拡張子を空にする (＝中身を読み込むファイルをゼロにする)
         args.preview_exts = []
@@ -621,7 +806,7 @@ def main():
     #         final_targets = set(focus_roots)
     final_targets = set(file_map.keys())
     
-    # ▼▼▼ 修正：ファイル名によるスコープ絞り込み機能を追加 ▼▼▼
+    # ファイル名によるスコープ絞り込み機能を追加
     focus_keyword = args.focus
     path_filter = None
 
@@ -658,8 +843,72 @@ def main():
 
     # Build Tree
     def build_tree(current_path):
+        # 共通処理: ファイルノードの生成
+        def _create_file_node(item: Path):
+            content = file_map[item]
+            
+            # 要約のみモードの場合は、中身をパースして上書き
+            if args.summary_only and content:
+                item_str = str(item.resolve())
+                try:
+                    current_mtime = os.path.getmtime(item)
+                except Exception:
+                    current_mtime = 0
+                
+                # キャッシュヒットチェック
+                if item_str in cache_dict and cache_dict[item_str].get("mtime") == current_mtime:
+                    log_debug(f"Cache HIT for: {item.name}", args.debug)
+                    content = cache_dict[item_str].get("cached_content", "")
+                else:
+                    log_debug(f"Cache MISS (or updated) for: {item.name}. Parsing...", args.debug)
+                    
+                    # 1. 要約の抽出
+                    summary_text = extract_summary(content, item.suffix.lower(), args.debug)
+                    if not summary_text:
+                        summary_text = "(No summary provided)"
+                    
+                    # 2. 構造タグの抽出
+                    tags = extract_tags(content, item.suffix.lower(), args.debug)
+                    
+                    # 3. コンテキストの結合
+                    if tags:
+                        tag_str = ", ".join(tags)
+                        content = f"{summary_text}\n\n[Tags: {tag_str}]"
+                    else:
+                        content = summary_text
+                        
+                    # キャッシュの更新
+                    cache_dict[item_str] = {
+                        "mtime": current_mtime,
+                        "cached_content": content
+                    }
+                    
+            if args.focus:
+                extracted = None
+                if HAS_TREESITTER:
+                    extracted = extract_code_block_treesitter(content, item.suffix.lower(), args.focus)
+                if not extracted and item.suffix.lower() == '.py':
+                    extracted = extract_code_block_ast(content, args.focus)
+                if not extracted:
+                    extracted = extract_code_block_braces(content, args.focus)
+                if extracted:
+                    content = extracted
+            
+            if content:
+                lines = content.splitlines()[:args.preview_lines]
+                preview_text = "\n".join(lines)
+            else:
+                preview_text = ""
+            return {"name": item.name, "preview": preview_text}
+
+        # 1. パスが単一ファイルの場合の直接処理
+        if current_path.is_file():
+            if current_path in final_targets:
+                return _create_file_node(current_path)
+            return None
+
+        # 2. パスがディレクトリの場合の再帰処理
         node = {"name": current_path.name}
-        
         if current_path.is_dir():
             children = []
             try:
@@ -669,36 +918,15 @@ def main():
                     
                     if item.is_dir():
                         child = build_tree(item)
-                        
-                        # ▼▼▼ 修正箇所1: 子ディレクトリを追加する条件を緩和 ▼▼▼
+                        # 子ディレクトリを追加する条件を緩和
                         if child:
-                            # ディレクトリのみモードなら、中身に関わらず追加
                             if args.directories_only:
                                 children.append(child)
-                            # 通常モードなら、中身がある場合のみ追加
                             elif child.get("children") or child.get("files_inside"):
                                 children.append(child)
                                 
                     elif item in final_targets:
-                        # (ここは変更なし)
-                        content = file_map[item]
-                        if args.focus:
-                            extracted = None
-                            if HAS_TREESITTER:
-                                extracted = extract_code_block_treesitter(content, item.suffix.lower(), args.focus)
-                            if not extracted and item.suffix.lower() == '.py':
-                                extracted = extract_code_block_ast(content, args.focus)
-                            if not extracted:
-                                extracted = extract_code_block_braces(content, args.focus)
-                            if extracted:
-                                content = extracted
-                        
-                        if content:
-                            lines = content.splitlines()[:args.preview_lines]
-                            preview_text = "\n".join(lines)
-                        else:
-                            preview_text = ""
-                        children.append({"name": item.name, "preview": preview_text})
+                        children.append(_create_file_node(item))
 
             except Exception:
                 pass
@@ -706,12 +934,10 @@ def main():
             node["children"] = children
             node["files_inside"] = len(children) > 0
             
-            # ▼▼▼ 修正箇所2: 自身を返す条件を緩和 ▼▼▼
-            # ディレクトリのみモードなら、中身が空でも自身（ディレクトリ）を返す
+            # 自身を返す条件を緩和
             if args.directories_only:
                 return node
             
-            # 通常時は、中身がある場合のみ返す
             return node if node["files_inside"] else None
         
         return None
@@ -736,36 +962,69 @@ def main():
                 
                 return # ツリー表示だけして終了
             
-            json_str = json.dumps(root_node, ensure_ascii=False, indent=None, separators=(',', ':'))
+            if args.text:
+                log_debug("Generating Markdown text output...", args.debug)
+                def generate_text_from_tree(node, current_path=""):
+                    text_parts = []
+                    # ディレクトリの場合
+                    if "children" in node:
+                        for child in node["children"]:
+                            # 親パスと子要素の名前を結合して現在のパスを生成
+                            child_path = f"{current_path}/{child['name']}".strip('/') if current_path else child['name']
+                            text_parts.extend(generate_text_from_tree(child, child_path))
+                    # ファイル単体の場合
+                    else:
+                        file_path = current_path if current_path else node['name']
+                        if node.get("preview") is not None and node.get("preview") != "":
+                            ext = '.' + node['name'].split('.')[-1].lower() if '.' in node['name'] else ''
+                            lang = TREESITTER_EXT_MAP.get(ext, "")
+                            text_parts.append(f"### File: {file_path}\n```{lang}\n{node['preview']}\n```\n")
+                            log_debug(f"Added content for text output: {file_path}", args.debug)
+                        else:
+                            text_parts.append(f"### File: {file_path} (No content preview)\n")
+                            log_debug(f"Added file path only for text output: {file_path}", args.debug)
+                    return text_parts
+
+                text_lines = generate_text_from_tree(root_node)
+                output_str = "\n".join(text_lines)
+            else:
+                log_debug("Generating JSON output...", args.debug)
+                output_str = json.dumps(root_node, ensure_ascii=False, indent=None, separators=(',', ':'))
             
             # Token Count
-            count = len(json_str) // 4
+            count = len(output_str) // 4
             if HAS_TIKTOKEN:
                 try:
-                    count = len(tiktoken.encoding_for_model(args.model).encode(json_str))
-                except Exception:
+                    count = len(tiktoken.encoding_for_model(args.model).encode(output_str))
+                    log_debug("Token count calculated via tiktoken.", args.debug)
+                except Exception as e:
+                    log_debug(f"Tiktoken encoding failed: {e}. Falling back to heuristic calculation.", args.debug)
                     pass
             print(f"[Tokens: {count:,}]", file=sys.stderr)
 
             if args.outfile:
                 with open(args.outfile, 'w', encoding='utf-8') as f:
-                    f.write(json_str)
+                    f.write(output_str)
                 print(f"Saved to {args.outfile}")
+                
+            # キャッシュの保存 (要約モードの時のみ)
+            if args.summary_only:
+                save_cache(root_path if root_path.is_dir() else root_path.parent, cache_dict, args.debug)
             
             # コピー指定がある場合の処理
             elif args.copy:
                 if HAS_PYPERCLIP:
-                    pyperclip.copy(json_str)
+                    pyperclip.copy(output_str)
                     print(">> Copied to clipboard! <<", file=sys.stderr)
                 else:
                     print(">> [ERROR] クリップボードへのコピーに失敗しました。", file=sys.stderr)
                     print(">> 必要なライブラリが見つかりません: pip install pyperclip", file=sys.stderr)
                     print(">> 代わりに標準出力に表示します:\n", file=sys.stderr)
-                    print(json_str)
+                    print(output_str)
 
             # ファイル指定もコピー指定もない場合（標準出力）
             else:
-                print(json_str)
+                print(output_str)
 
         except Exception as e:
             print(f"[ERROR] {e}", file=sys.stderr)
