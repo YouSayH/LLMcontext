@@ -858,42 +858,40 @@ class SimpleBM25:
 # 3.8. ONNX Semantic Search Engine
 # ==========================================
 class ONNXSemanticSearch:
-    """ONNX Runtimeを用いたローカル・セマンティック検索"""
-    # 非常に軽量でコード検索にも強い 'all-MiniLM-L6-v2' の量子化モデルを使用 (約22MB)
-    MODEL_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
-    TOKENIZER_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+    """ONNX Runtimeを用いたローカル・セマンティック検索 (Ruri-v3-30m Quantized対応)"""
     
-    def __init__(self, cache_dir: Path, is_debug: bool):
+    def __init__(self, model_dir: Path, is_debug: bool):
         self.is_debug = is_debug
-        self.model_path = cache_dir / "model_quantized.onnx"
-        self.tokenizer_path = cache_dir / "tokenizer.json"
-        self._ensure_models(cache_dir)
+        self.model_path = model_dir / "model_quantized.onnx"
+        self.tokenizer_path = model_dir / "tokenizer.json"
         
-        log_debug("Loading ONNX model and Tokenizer...", self.is_debug)
+        log_debug(f"Targeting Ruri model directory: {model_dir}", self.is_debug)
+        
+        if not self.model_path.exists() or not self.tokenizer_path.exists():
+            error_msg = f"[ERROR] Model files not found in {model_dir}. Please ensure 'ruri_30m_quantized' is placed correctly."
+            print(error_msg, file=sys.stderr)
+            log_debug(error_msg, self.is_debug)
+            raise FileNotFoundError("Ruri quantized model files are missing.")
+            
+        log_debug("Loading Ruri Tokenizer...", self.is_debug)
         self.tokenizer = Tokenizer.from_file(str(self.tokenizer_path))
         self.tokenizer.enable_padding(direction='right', pad_id=0, pad_type_id=0, pad_token='[PAD]')
-        self.tokenizer.enable_truncation(max_length=256) # ノートPCのメモリに優しく長さを制限
+        self.tokenizer.enable_truncation(max_length=512) 
         
-        # 警告を抑制しつつCPUで推論
         opts = ort.SessionOptions()
         opts.log_severity_level = 3
+        log_debug("Initializing InferenceSession on CPU for Ruri-v3...", self.is_debug)
         self.session = ort.InferenceSession(str(self.model_path), sess_options=opts, providers=['CPUExecutionProvider'])
+        log_debug("✅ Ruri-v3 model loaded successfully.", self.is_debug)
 
-    def _ensure_models(self, cache_dir: Path):
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        if not self.model_path.exists():
-            log_debug("Downloading lightweight ONNX model (approx 22MB)...", self.is_debug)
-            urllib.request.urlretrieve(self.MODEL_URL, self.model_path)
-        if not self.tokenizer_path.exists():
-            log_debug("Downloading Tokenizer...", self.is_debug)
-            urllib.request.urlretrieve(self.TOKENIZER_URL, self.tokenizer_path)
-
-    def encode(self, texts: List[str]) -> 'np.ndarray':
-        encodings = self.tokenizer.encode_batch(texts)
+    def encode(self, texts: List[str], prefix: str = "") -> 'np.ndarray':
+        prefixed_texts = [prefix + text for text in texts]
+        log_debug(f"Encoding {len(texts)} texts with prefix: '{prefix}'", self.is_debug)
+        
+        encodings = self.tokenizer.encode_batch(prefixed_texts)
         input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
         
-        # ONNXの入力構成を取得
         input_names = [i.name for i in self.session.get_inputs()]
         ort_inputs = {
             "input_ids": input_ids,
@@ -904,7 +902,6 @@ class ONNXSemanticSearch:
             
         outputs = self.session.run(None, ort_inputs)
         
-        # Mean Pooling処理 (各トークンのベクトルを平均して文全体のベクトルを作成)
         token_embeddings = outputs[0]
         input_mask_expanded = np.broadcast_to(np.expand_dims(attention_mask, -1), token_embeddings.shape)
         sum_embeddings = np.sum(token_embeddings * input_mask_expanded, 1)
@@ -913,22 +910,27 @@ class ONNXSemanticSearch:
         return sum_embeddings / sum_mask
 
     def get_scores(self, query: str, corpus: List[str]) -> List[float]:
-        if not corpus: return []
-        log_debug("Calculating semantic similarity with ONNX...", self.is_debug)
+        if not corpus:
+            return []
+        log_debug(f"Calculating semantic similarity for query: '{query}'", self.is_debug)
         
-        query_vec = self.encode([query])[0]
-        corpus_vecs = self.encode(corpus)
+        query_vec = self.encode([query], prefix="検索クエリ: ")[0]
+        log_debug("✅ Query encoded.", self.is_debug)
         
-        # コサイン類似度の計算
+        corpus_vecs = self.encode(corpus, prefix="検索文書: ")
+        log_debug("✅ Corpus encoded.", self.is_debug)
+        
         scores = []
         q_norm = np.linalg.norm(query_vec)
-        for vec in corpus_vecs:
+        for i, vec in enumerate(corpus_vecs):
             v_norm = np.linalg.norm(vec)
             if q_norm == 0 or v_norm == 0:
                 scores.append(0.0)
             else:
                 sim = np.dot(query_vec, vec) / (q_norm * v_norm)
                 scores.append(float(sim))
+                
+        log_debug(f"Scoring completed. Max score: {max(scores):.4f} if scores else 0.0", self.is_debug)
         return scores
 
 # ==========================================
@@ -1317,9 +1319,16 @@ def main():
 
             # ONNXスコアリング (意味の一致)
             if getattr(args, 'semantic_search', False) and HAS_ONNX:
-                onnx_cache_dir = root_path / ".onnx_cache"
-                onnx_engine = ONNXSemanticSearch(onnx_cache_dir, args.debug)
-                onnx_scores = onnx_engine.get_scores(args.search, search_corpus)
+                # 実行されているスクリプト自身のディレクトリを基準にモデルパスを指定
+                ruri_model_dir = Path(__file__).resolve().parent / "ruri_30m_quantized"
+                try:
+                    log_debug(f"Initializing ONNX engine from: {ruri_model_dir}", args.debug)
+                    onnx_engine = ONNXSemanticSearch(ruri_model_dir, args.debug)
+                    onnx_scores = onnx_engine.get_scores(args.search, search_corpus)
+                except FileNotFoundError as e:
+                    print(f"[ERROR] {e}", file=sys.stderr)
+                    log_debug("Fallback to BM25 only due to missing ONNX model.", args.debug)
+                    onnx_scores = [0.0] * len(search_corpus)
             elif getattr(args, 'semantic_search', False) and not HAS_ONNX:
                 log_debug("ONNX runtime dependencies are missing. Install with: pip install onnxruntime tokenizers numpy", args.debug)
 
@@ -1343,8 +1352,8 @@ def main():
             search_hits = set()
             hit_count = 0
             for file_path, c_score, b_score, o_score in scored_results:
-                # 複合スコアが一定以上(0.1以上)の有意な結果のみ対象とし、上位 top_k 件で打ち切る
-                if c_score >= 0.1:
+                # 足切りを撤廃し、関連性がある(0.0より大きい)上位 top_k 件を抽出
+                if c_score > 0.0:
                     log_debug(f"Search HIT [Rank {hit_count+1}] [Combined: {c_score:.3f} | BM25: {b_score:.3f}, ONNX: {o_score:.3f}] - {file_path.name}", args.debug)
                     search_hits.add(file_path)
                     hit_count += 1
@@ -1353,10 +1362,13 @@ def main():
                         break
             
             if search_hits:
-                # 絞り込み結果でターゲットを上書き
-                final_targets = search_hits
+                # 1. 検索でヒットした「目的のファイル」を全文出力リストに自動追加する
+                args.full.extend([p.name for p in search_hits])
                 
-                # 検索モードの場合は、強制的に summary_only を ON にして結果を見やすくする
+                # 2. ターゲットの絞り込みを解除し、プロジェクトの全ファイルを対象に残す
+                # final_targets = search_hits  <- この行を削除（またはコメントアウト）
+                
+                # 3. 目的以外のファイル（プロジェクト全体）は要約出力モードにする
                 args.summary_only = True 
             else:
                 log_debug("No related files found for the query.", args.debug)
@@ -1393,49 +1405,53 @@ def main():
             content = file_map[item]
             is_smart_dep = item in smart_deps
             
-            # アウトラインモード、またはSmart Contextによる依存先ファイルの場合はシグネチャを抽出して上書き
-            if (getattr(args, 'outline', False) or is_smart_dep) and content:
+            # インタラクティブモードでのユーザー選択を取得（最優先）
+            interactive_mode = file_output_modes.get(item) if 'file_output_modes' in locals() or 'file_output_modes' in globals() else None
+            
+            # 各出力モードの判定
+            is_full = interactive_mode == 'f' or any(f in item.name for f in getattr(args, 'full', []))
+            is_outline = interactive_mode == 'o' or (not interactive_mode and getattr(args, 'outline', False)) or is_smart_dep
+            is_summary = interactive_mode == 's' or (not interactive_mode and getattr(args, 'summary_only', False))
+
+            if is_full:
+                pass # 全文出力モード（contentを書き換えずにそのままにする）
+                
+            elif is_outline and content:
                 outline_text = extract_outline(content, item.suffix.lower(), args.debug)
                 if is_smart_dep:
                     content = f"// [Smart Context: Auto-resolved Dependency Outline]\n{outline_text}"
                 else:
                     content = outline_text
                 
-            # 要約のみモードの場合は、中身をパースして上書き
-            elif getattr(args, 'summary_only', False) and content:
-                # 追加: --full で指定されたファイル名が含まれていれば要約化をスキップ（全文のままにする）
-                is_forced_full = any(f in item.name for f in getattr(args, 'full', []))
+            elif is_summary and content:
+                item_str = str(item.resolve())
+                try:
+                    current_mtime = os.path.getmtime(item)
+                except Exception:
+                    current_mtime = 0
                 
-                if not is_forced_full:
-                    item_str = str(item.resolve())
-                    try:
-                        current_mtime = os.path.getmtime(item)
-                    except Exception:
-                        current_mtime = 0
+                # キャッシュヒットチェック
+                if item_str in cache_dict and cache_dict[item_str].get("mtime") == current_mtime:
+                    log_debug(f"Cache HIT for: {item.name}", args.debug)
+                    content = cache_dict[item_str].get("cached_content", "")
+                else:
+                    log_debug(f"Cache MISS (or updated) for: {item.name}. Parsing...", args.debug)
                     
-                    # キャッシュヒットチェック
-                    if item_str in cache_dict and cache_dict[item_str].get("mtime") == current_mtime:
-                        log_debug(f"Cache HIT for: {item.name}", args.debug)
-                        content = cache_dict[item_str].get("cached_content", "")
-                    else:
-                        log_debug(f"Cache MISS (or updated) for: {item.name}. Parsing...", args.debug)
-                        
-                        # 1. 要約の抽出
-                        summary_text = extract_summary(content, item.suffix.lower(), args.debug)
-                        if not summary_text:
-                            summary_text = "(No summary provided)"
-                        
-                        # 2. 構造タグと自然言語タグの両方を抽出 (引数変更)
-                        tags = extract_tags(content, summary_text, item.suffix.lower(), args.debug, global_vocab, idf_dict)
+                    # 1. 要約の抽出
+                    summary_text = extract_summary(content, item.suffix.lower(), args.debug)
+                    if not summary_text:
+                        summary_text = "(No summary provided)"
                     
-                    # 3. コンテキストの結合
+                    # 2. 構造タグと自然言語タグの両方を抽出
+                    tags = extract_tags(content, summary_text, item.suffix.lower(), args.debug, global_vocab, idf_dict)
+                
+                    # 3. コンテキストの結合とキャッシュ保存 (※エラーを防ぐため else ブロックの中に移動)
                     if tags:
                         tag_str = ", ".join(tags)
                         content = f"{summary_text}\n\n[Tags: {tag_str}]"
                     else:
                         content = summary_text
                         
-                    # キャッシュの更新
                     cache_dict[item_str] = {
                         "mtime": current_mtime,
                         "cached_content": content
@@ -1470,7 +1486,12 @@ def main():
         if current_path.is_dir():
             children = []
             try:
-                for item in sorted(current_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                items = sorted(current_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+            except Exception:
+                items = [] # 権限エラー等でアクセスできないディレクトリはスキップ
+
+            for item in items:
+                try:
                     if should_exclude(item.name, args.exclude):
                         continue
                     
@@ -1485,9 +1506,10 @@ def main():
                                 
                     elif item in final_targets:
                         children.append(_create_file_node(item))
-
-            except Exception:
-                pass
+                except Exception as e:
+                    # 個別のファイル処理でエラーが起きても全体を止めないが、デバッグログには残す
+                    log_debug(f"Error processing {item.name}: {e}", args.debug)
+                    continue
             
             node["children"] = children
             node["files_inside"] = len(children) > 0
@@ -1565,15 +1587,17 @@ def main():
                     f.write(output_str)
                 print(f"Saved to {args.outfile}")
                 
-            # キャッシュの保存 (キャッシュの中身が更新されている可能性があるため常に保存を試みる)
+            # キャッシュの保存 (コピー処理などをスキップしないよう独立したif文にする)
             if cache_dict:
                 save_cache(root_path if root_path.is_dir() else root_path.parent, cache_dict, args.debug)
+                log_debug("Cache saved successfully.", args.debug)
             
             # コピー指定がある場合の処理
-            elif args.copy:
+            if args.copy:
                 if HAS_PYPERCLIP:
                     pyperclip.copy(output_str)
                     print(">> Copied to clipboard! <<", file=sys.stderr)
+                    log_debug("Content successfully copied to clipboard.", args.debug)
                 else:
                     print(">> [ERROR] クリップボードへのコピーに失敗しました。", file=sys.stderr)
                     print(">> 必要なライブラリが見つかりません: pip install pyperclip", file=sys.stderr)
@@ -1581,7 +1605,7 @@ def main():
                     print(output_str)
 
             # ファイル指定もコピー指定もない場合（標準出力）
-            else:
+            elif not args.outfile:
                 print(output_str)
 
         except Exception as e:
