@@ -811,11 +811,16 @@ class SimpleBM25:
         self._initialize(corpus)
 
     def _tokenize(self, text: str) -> List[str]:
-        # 日本語や記号も考慮し、英数字とひらがなカタカナ漢字の連続をトークン化する簡易実装
         text = text.lower()
-        # 記号を除去し、空白で分割 (簡易的だが、タグ検索などには十分)
-        words = re.findall(r'\w+', text)
-        return words
+        # 1. 英数字のまとまりを抽出
+        alphanumeric = re.findall(r'[a-z0-9_]+', text)
+        
+        # 2. 日本語（漢字、ひらがな、カタカナなど）の抽出とバイグラム化（2文字ずつのペア）
+        japanese_text = re.sub(r'[a-z0-9_\s\W]+', '', text)
+        bigrams = [japanese_text[i:i+2] for i in range(len(japanese_text) - 1)] if len(japanese_text) > 1 else [japanese_text] if japanese_text else []
+        
+        tokens = alphanumeric + bigrams
+        return [t for t in tokens if t]
 
     def _initialize(self, corpus: List[str]):
         nd = {}
@@ -840,9 +845,12 @@ class SimpleBM25:
             idf_score = math.log(1 + (self.corpus_size - freq + 0.5) / (freq + 0.5))
             self.idf[word] = idf_score
 
-    def get_scores(self, query: str) -> List[float]:
+    def get_scores(self, query: str, is_debug: bool = False) -> List[float]:
         score = [0.0] * self.corpus_size
         query_words = self._tokenize(query)
+        if is_debug:
+            print(f"[DEBUG BM25] Query tokens: {query_words}", file=sys.stderr)
+            
         for q_word in query_words:
             if q_word not in self.idf:
                 continue
@@ -1315,22 +1323,27 @@ def main():
 
             # BM25スコアリング (キーワード一致)
             bm25 = SimpleBM25(search_corpus)
-            bm25_scores = bm25.get_scores(args.search)
+            bm25_scores = bm25.get_scores(args.search, args.debug)
 
             # ONNXスコアリング (意味の一致)
-            if getattr(args, 'semantic_search', False) and HAS_ONNX:
-                # 実行されているスクリプト自身のディレクトリを基準にモデルパスを指定
-                ruri_model_dir = Path(__file__).resolve().parent / "ruri_30m_quantized"
-                try:
-                    log_debug(f"Initializing ONNX engine from: {ruri_model_dir}", args.debug)
-                    onnx_engine = ONNXSemanticSearch(ruri_model_dir, args.debug)
-                    onnx_scores = onnx_engine.get_scores(args.search, search_corpus)
-                except FileNotFoundError as e:
-                    print(f"[ERROR] {e}", file=sys.stderr)
-                    log_debug("Fallback to BM25 only due to missing ONNX model.", args.debug)
-                    onnx_scores = [0.0] * len(search_corpus)
-            elif getattr(args, 'semantic_search', False) and not HAS_ONNX:
-                log_debug("ONNX runtime dependencies are missing. Install with: pip install onnxruntime tokenizers numpy", args.debug)
+            onnx_scores = [0.0] * len(search_corpus)
+            if getattr(args, 'semantic_search', False):
+                if HAS_ONNX:
+                    ruri_model_dir = Path(__file__).resolve().parent / "ruri_30m_quantized"
+                    try:
+                        log_debug(f"Initializing ONNX engine from: {ruri_model_dir}", args.debug)
+                        onnx_engine = ONNXSemanticSearch(ruri_model_dir, args.debug)
+                        onnx_scores = onnx_engine.get_scores(args.search, search_corpus)
+                        if args.debug:
+                            print(f"[DEBUG ONNX] Max score: {max(onnx_scores) if onnx_scores else 0}", file=sys.stderr)
+                    except FileNotFoundError as e:
+                        print(f"[ERROR] {e}", file=sys.stderr)
+                        log_debug("Fallback to BM25 only due to missing ONNX model.", args.debug)
+                else:
+                    print("[WARNING] --semantic-search is enabled, but ONNX dependencies are missing. Falling back to BM25.", file=sys.stderr)
+                    log_debug("ONNX runtime dependencies are missing. Install with: pip install onnxruntime tokenizers numpy", args.debug)
+            else:
+                log_debug("Semantic search is DISABLED. Using BM25 only.", args.debug)
 
             # 3. ハイブリッド・スコアリング (正規化と結合)
             # BM25スコアを 0.0 ~ 1.0 に正規化

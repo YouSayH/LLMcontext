@@ -8,3 +8,7 @@ tree-sitter-languages
 networkx
 tiktoken
 pyperclip
+"optimum[onnxruntime]"
+tokenizers
+numpy
+sentencepiece

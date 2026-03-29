@@ -132,3 +132,5 @@ __pycache__/
 *.json
 
 *.ipynb
+*_quantized
+*_onnx
